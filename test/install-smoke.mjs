@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { copyFile, cp, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const packageRoot = path.resolve(new URL('..', import.meta.url).pathname);
-const workDir = await mkdtemp(path.join(tmpdir(), 'cloptima-llm-js-install-'));
+const workDir = path.join(packageRoot, '.tmp-install-smoke');
+const typeScriptCli = path.join(packageRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -20,6 +20,8 @@ function run(command, args, options = {}) {
 }
 
 try {
+  await rm(workDir, { recursive: true, force: true });
+  await mkdir(workDir, { recursive: true });
   const packageCopy = path.join(workDir, 'package');
   await mkdir(packageCopy);
   await copyFile(path.join(packageRoot, 'package.json'), path.join(packageCopy, 'package.json'));
@@ -34,8 +36,7 @@ try {
   });
   await writeFile(path.join(packageCopy, 'package.json'), JSON.stringify(packageJson, null, 2));
 
-  run('npm', ['install', '--ignore-scripts'], { cwd: packageCopy });
-  run('npm', ['run', 'build'], { cwd: packageCopy });
+  run('node', [typeScriptCli, '-p', 'tsconfig.json'], { cwd: packageCopy });
   const pack = run('npm', ['pack', '--json'], { cwd: packageCopy });
   let packedFilename;
   let packedFiles = [];

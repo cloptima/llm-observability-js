@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
-const buildDir = process.env.CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD || '/tmp/cloptima-llm-observability-js-test-build';
+const buildDir = path.resolve(
+  process.env.CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD
+  || path.resolve(new URL('..', import.meta.url).pathname, '.tmp-test-build'),
+);
+const buildDirUrl = pathToFileURL(`${buildDir}/`).href;
 const DEFAULT_API_BASE_URL = 'https://api.cloptima.ai';
 const TEST_API_BASE_URL = 'https://sdk-ingest.example.cloptima.ai';
 const DEFAULT_INGEST_URL = `${DEFAULT_API_BASE_URL}/v1/ai/integrations/sdk/events`;
@@ -60,7 +66,7 @@ const {
   withTask,
   withWorkflow,
   withUsageOverrides,
-} = await import(`${buildDir}/src/index.js`);
+} = await import(`${buildDirUrl}src/index.js`);
 
 function camelExpected(expected) {
   const mapped = {
@@ -1008,6 +1014,56 @@ test('observeCall accepts flat attribution fields and per-call metadata privacy 
   assert.equal(body.metadata.workflow_id, 'support-agent');
   assert.equal(body.metadata.route, '/summaries');
   assert.equal(body.metadata.prompt, undefined);
+});
+
+test('observeCall transmits business transaction fields at the top-level of the payload', async () => {
+  let body;
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: {
+      appId: 'agent-api',
+      environment: 'dev',
+      businessTransactionId: 'bt-init-id',
+      businessTransactionType: 'bt-init-type',
+    },
+    fetchImpl: async (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return new Response('{}', { status: 202 });
+    },
+  });
+
+  const result = await client.observeCall({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    call: () => ({
+      id: 'chatcmpl-bt-1',
+      model: 'gpt-4o-mini',
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 5,
+        total_tokens: 10,
+      },
+    }),
+    extractUsage: extractOpenAIUsage,
+    businessTransactionUnitCount: 42,
+    businessOutcomeStatus: 'success',
+    businessValueCents: 150,
+    businessOwner: 'accounting',
+    workflowStep: 'pricing-calculation',
+    fireAndForget: false,
+  });
+
+  assert.equal(result.id, 'chatcmpl-bt-1');
+  // Check that default values propagate
+  assert.equal(body.business_transaction_id, 'bt-init-id');
+  assert.equal(body.business_transaction_type, 'bt-init-type');
+  // Check that per-call values propagate
+  assert.equal(body.business_transaction_unit_count, 42);
+  assert.equal(body.business_outcome_status, 'success');
+  assert.equal(body.business_value_cents, 150);
+  assert.equal(body.business_owner, 'accounting');
+  assert.equal(body.workflow_step, 'pricing-calculation');
 });
 
 test('runWithAttribution applies ambient attribution and keeps explicit per-call overrides', async () => {

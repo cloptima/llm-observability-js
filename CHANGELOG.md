@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Added support for tracking normalized `businessOutcomeSuccess` boolean flags alongside descriptive statuses.
+- Fixed streaming usage token aggregation for Bedrock and Anthropic stream providers.
+
 ## 0.2.2
 
 - Improved delivery reliability so observed calls report submission issues more consistently while keeping application instrumentation lightweight.

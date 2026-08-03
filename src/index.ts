@@ -1,4 +1,4 @@
-const PACKAGE_VERSION = '0.2.0';
+const PACKAGE_VERSION = '0.2.3';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -43,6 +43,14 @@ export type LLMAttribution = {
   environment: string;
   actorId?: string;
   actorType?: 'human' | 'service' | 'agent';
+  businessTransactionId?: string;
+  businessTransactionType?: string;
+  businessTransactionUnitCount?: number;
+  businessOutcomeStatus?: string;
+  businessOutcomeSuccess?: boolean;
+  businessValueCents?: number;
+  businessOwner?: string;
+  workflowStep?: string;
 };
 
 export type LLMAgentContext = {
@@ -427,6 +435,14 @@ function attributionFromFlatFields(options: Partial<LLMAttribution>): Partial<LL
     environment: cleanString(options.environment),
     actorId: cleanString(options.actorId),
     actorType: cleanString(options.actorType) as LLMAttribution['actorType'] | undefined,
+    businessTransactionId: cleanString(options.businessTransactionId),
+    businessTransactionType: cleanString(options.businessTransactionType),
+    businessTransactionUnitCount: cleanNumber(options.businessTransactionUnitCount),
+    businessOutcomeStatus: cleanString(options.businessOutcomeStatus),
+    businessOutcomeSuccess: parseBooleanEnv(options.businessOutcomeSuccess),
+    businessValueCents: cleanNumber(options.businessValueCents),
+    businessOwner: cleanString(options.businessOwner),
+    workflowStep: cleanString(options.workflowStep),
   });
 }
 
@@ -1694,6 +1710,14 @@ function buildPayload(
     completed_at: toIso(event.completedAt),
     latency_ms: cleanNumber(event.latencyMs),
     error_message: cleanString(event.errorMessage),
+    business_transaction_id: attribution.businessTransactionId,
+    business_transaction_type: attribution.businessTransactionType,
+    business_transaction_unit_count: attribution.businessTransactionUnitCount,
+    business_outcome_status: attribution.businessOutcomeStatus,
+    business_outcome_success: attribution.businessOutcomeSuccess,
+    business_value_cents: attribution.businessValueCents,
+    business_owner: attribution.businessOwner,
+    workflow_step: attribution.workflowStep,
     metadata: stripUndefined({
       ...(sanitizedCustomMetadata || {}),
       ...stripUndefined({
@@ -2362,6 +2386,14 @@ function resolvedInitAttribution(options: InitFromEnvOptions | undefined): Parti
     environment: cleanString(options?.defaultAttribution?.environment) || cleanString(env[INIT_ENVIRONMENT_ENV]) || 'production',
     actorId: cleanString(options?.defaultAttribution?.actorId),
     actorType: cleanString(options?.defaultAttribution?.actorType) as LLMAttribution['actorType'] | undefined,
+    businessTransactionId: cleanString(options?.defaultAttribution?.businessTransactionId),
+    businessTransactionType: cleanString(options?.defaultAttribution?.businessTransactionType),
+    businessTransactionUnitCount: cleanNumber(options?.defaultAttribution?.businessTransactionUnitCount),
+    businessOutcomeStatus: cleanString(options?.defaultAttribution?.businessOutcomeStatus),
+    businessOutcomeSuccess: parseBooleanEnv(options?.defaultAttribution?.businessOutcomeSuccess),
+    businessValueCents: cleanNumber(options?.defaultAttribution?.businessValueCents),
+    businessOwner: cleanString(options?.defaultAttribution?.businessOwner),
+    workflowStep: cleanString(options?.defaultAttribution?.workflowStep),
   });
 }
 

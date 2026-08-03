@@ -1,6 +1,6 @@
 {
   "name": "@cloptima/llm-observability",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "LLM usage telemetry SDK for Cloptima reporting, attribution, and analytics",
   "license": "UNLICENSED",
   "type": "module",
@@ -45,7 +45,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json --outDir /tmp/cloptima-llm-observability-js-test-build && CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD=/tmp/cloptima-llm-observability-js-test-build node --test test/*.test.mjs && node test/install-smoke.mjs"
+    "test": "rm -rf .tmp-test-build && tsc -p tsconfig.json --outDir .tmp-test-build && CLOPTIMA_LLM_OBSERVABILITY_TEST_BUILD=.tmp-test-build node --test test/*.test.mjs && node test/install-smoke.mjs"
   },
   "devDependencies": {
     "typescript": "^5.0.0"
