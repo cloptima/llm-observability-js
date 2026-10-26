@@ -11,7 +11,7 @@ const client = initFromEnv({
   },
   fetchImpl: async (_url, init) => {
     const payload = JSON.parse(String(init.body))
-    if (payload.provider !== "gemini" || payload.model !== "gemini-2.5-pro") {
+    if (payload.provider !== "gemini" || payload.model !== "gemini-3.8-flash") {
       throw new Error("unexpected telemetry payload")
     }
     return new Response("{}", { status: 202 })
@@ -20,10 +20,10 @@ const client = initFromEnv({
 
 await client.observeCall({
   provider: "gemini",
-  model: "gemini-2.5-pro",
+  model: "gemini-3.8-flash",
   call: () => ({
     responseId: "gemini-example",
-    modelVersion: "gemini-2.5-pro",
+    modelVersion: "gemini-3.8-flash",
     usageMetadata: {
       promptTokenCount: 6,
       responseTokenCount: 3,

@@ -38,7 +38,7 @@ const {
   extractAnthropicStreamUsage,
   extractAnthropicUsage,
   extractBedrockStreamUsage,
-  extractAzureOpenAIUsage,
+  extractAzureUsage,
   extractBedrockUsage,
   extractGeminiStreamUsage,
   extractGeminiUsage,
@@ -88,7 +88,7 @@ function camelExpected(expected) {
 function extractFixtureUsage(fixture) {
   if (fixture.provider === 'openai' && fixture.kind === 'stream') return extractOpenAIStreamUsage(fixture.payload);
   if (fixture.provider === 'openai') return extractOpenAIUsage(fixture.payload);
-  if (fixture.provider === 'azure_openai') return extractAzureOpenAIUsage(fixture.payload);
+  if (fixture.provider === 'azure') return extractAzureUsage(fixture.payload);
   if (fixture.provider === 'anthropic' && fixture.kind === 'stream') return extractAnthropicStreamUsage(fixture.payload);
   if (fixture.provider === 'anthropic') return extractAnthropicUsage(fixture.payload);
   if (fixture.provider === 'gemini' && fixture.kind === 'stream') return extractGeminiStreamUsage(fixture.payload);
@@ -888,8 +888,10 @@ test('observe records successful calls with extracted OpenAI usage', async () =>
   assert.equal(response.id, 'chatcmpl-1');
   assert.equal(body?.provider, 'openai');
   assert.equal(body?.provider_request_id, 'chatcmpl-1');
-  assert.equal(body?.input_tokens, 7);
-  assert.equal(body?.output_tokens, 3);
+  // Prompt tokens count the 4 cache writes, which bill as cache_write units.
+  assert.equal(body?.input_tokens, 3);
+  // The 3 completion tokens count the reasoning token.
+  assert.equal(body?.output_tokens, 2);
   assert.equal(body?.reasoning_tokens, 1);
   assert.equal(body?.cached_input_tokens, 2);
   assert.deepEqual(body?.extra_usage_units, { cache_write_5m: 4 });
@@ -1049,7 +1051,6 @@ test('observeCall transmits business transaction fields at the top-level of the 
     businessTransactionUnitCount: 42,
     businessOutcomeStatus: 'success',
     businessValueCents: 150,
-    businessOwner: 'accounting',
     workflowStep: 'pricing-calculation',
     fireAndForget: false,
   });
@@ -1062,7 +1063,6 @@ test('observeCall transmits business transaction fields at the top-level of the 
   assert.equal(body.business_transaction_unit_count, 42);
   assert.equal(body.business_outcome_status, 'success');
   assert.equal(body.business_value_cents, 150);
-  assert.equal(body.business_owner, 'accounting');
   assert.equal(body.workflow_step, 'pricing-calculation');
 });
 
@@ -2020,7 +2020,7 @@ test('instrumentNextJsRouteContext extracts request metadata from Request object
   assert.equal(context.metadata.http_header_user_agent, 'next-test');
 });
 
-test('instrumentOpenAICompatibleStream preserves azure_openai provider attribution', async () => {
+test('instrumentOpenAICompatibleStream preserves azure provider attribution', async () => {
   let body;
   const client = new CloptimaLLMObservability({
     apiBaseUrl: TEST_API_BASE_URL,
@@ -2046,14 +2046,65 @@ test('instrumentOpenAICompatibleStream preserves azure_openai provider attributi
 
   const emitted = [];
   for await (const chunk of instrumentOpenAICompatibleStream(client, existingStream(), {
-    provider: 'azure_openai',
+    provider: 'azure',
     fireAndForget: false,
   })) {
     emitted.push(chunk);
   }
 
   assert.equal(emitted.length, 2);
-  assert.equal(body?.provider, 'azure_openai');
+  assert.equal(body?.provider, 'azure');
+});
+
+test('instrumentOpenAICompatibleStream and observe report a provider the caller names unchanged, never relabeled as openai', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+  async function* existingStream() {
+    yield { id: 'or-stream-1', model: 'gpt-4o-mini', usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } };
+  }
+  for await (const _chunk of instrumentOpenAICompatibleStream(client, existingStream(), { provider: 'openrouter', fireAndForget: false })) {
+    // drain
+  }
+  await client.observe({
+    provider: 'azure_openai', model: 'gpt-4o-mini', fireAndForget: false,
+    call: async () => ({ id: 'chatcmpl-1', usage: { prompt_tokens: 2, completion_tokens: 3 } }),
+    extractUsage: extractOpenAIUsage,
+  });
+  assert.deepEqual(bodies.map((body) => body.provider), ['openrouter', 'azure_openai']);
+});
+
+test('instrumentOpenAICompatibleResponse reports a provider the caller names unchanged, never relabeled as openai', async () => {
+  for (const legacyProvider of ['azure_openai', 'azure-openai']) {
+    let body;
+    const client = new CloptimaLLMObservability({
+      apiBaseUrl: TEST_API_BASE_URL,
+      apiKey: 'pat-test',
+      fetchImpl: async (_input, init) => {
+        body = JSON.parse(String(init?.body));
+        return new Response('{}', { status: 202 });
+      },
+    });
+
+    await instrumentOpenAICompatibleResponse(client, {
+      id: 'chatcmpl-legacy-azure',
+      deployment_name: 'gpt-4o-mini-prod',
+      usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+    }, {
+      provider: legacyProvider,
+      fireAndForget: false,
+    });
+
+    // The server resolves the name through the catalog's provider aliases.
+    assert.ok(body, legacyProvider);
+    assert.equal(body.provider, legacyProvider, legacyProvider);
+  }
 });
 
 test('observeStream defaults to fire-and-forget recording and bounds extractor chunks', async () => {
@@ -2199,9 +2250,10 @@ test('extractAnthropicStreamUsage aggregates message stream events', () => {
       provider: 'anthropic',
       providerRequestId: 'msg-stream',
       model: 'claude-3-5-sonnet',
-      inputTokens: 8,
+      // Anthropic's input_tokens leaves out the 2 cache reads.
+      inputTokens: 10,
       outputTokens: 4,
-      totalTokens: 12,
+      totalTokens: 14,
       cachedInputTokens: 2,
       extraUsageUnits: { cache_write: 3, input_audio: 5 },
       cacheHit: true,
@@ -2283,9 +2335,9 @@ test('provider usage extractors normalize common response shapes', () => {
       provider: 'anthropic',
       providerRequestId: 'msg-1',
       model: 'claude-3-5-sonnet',
-      inputTokens: 10,
+      inputTokens: 13,
       outputTokens: 5,
-      totalTokens: 15,
+      totalTokens: 18,
       cachedInputTokens: 3,
       extraUsageUnits: { cache_write: 7, input_audio: 4 },
       cacheHit: true,
@@ -2398,7 +2450,7 @@ test('provider usage extractors normalize common response shapes', () => {
     },
   );
   assert.deepEqual(
-    extractAzureOpenAIUsage({
+    extractAzureUsage({
       id: 'chatcmpl-azure',
       deployment_name: 'gpt-4o-mini-prod',
       usage: {
@@ -2418,7 +2470,7 @@ test('provider usage extractors normalize common response shapes', () => {
       reasoningTokens: undefined,
       cachedInputTokens: undefined,
       cacheHit: undefined,
-      provider: 'azure_openai',
+      provider: 'azure',
     },
   );
 });
@@ -2621,7 +2673,11 @@ test('createMappedUsageExtractor maps nested custom payloads without full custom
 });
 
 test('provider extractor registry resolves aliases and fixture coverage stays aligned', () => {
-  assert.equal(getProviderUsageExtractor('azure'), extractAzureOpenAIUsage);
+  assert.equal(getProviderUsageExtractor('azure'), extractAzureUsage);
+  assert.equal(getProviderUsageExtractor('azure_openai'), undefined);
+  assert.equal(getProviderUsageExtractor('azure-openai'), undefined);
+  assert.equal(getProviderStreamUsageExtractor('azure_openai'), undefined);
+  assert.deepEqual(PROVIDER_SUPPORT_MATRIX.find((descriptor) => descriptor.provider === 'azure')?.aliases, ['azure']);
   assert.equal(getProviderUsageExtractor('vertex-ai'), extractVertexUsage);
   assert.equal(getProviderStreamUsageExtractor('bedrock'), extractBedrockStreamUsage);
   assert.equal(getProviderUsageExtractor(), undefined);

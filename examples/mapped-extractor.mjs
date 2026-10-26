@@ -14,7 +14,7 @@ const client = initFromEnv({
     if (String(url) !== "https://api.cloptima.ai/v1/ai/integrations/sdk/events") {
       throw new Error("unexpected telemetry endpoint")
     }
-    if (payload.provider !== "vertex_ai" || payload.model !== "gemini-2.5-flash-image-preview") {
+    if (payload.provider !== "vertex_ai" || payload.model !== "gemini-3.8-flash") {
       throw new Error("unexpected provider mapping")
     }
     if (payload.provider_request_id !== "vertex-custom-1") {
@@ -54,11 +54,11 @@ const extractUsage = createMappedUsageExtractor({
 
 await client.observeCall({
   provider: "vertex_ai",
-  model: "gemini-2.5-flash-image-preview",
+  model: "gemini-3.8-flash",
   call: () => ({
     response: {
       id: "vertex-custom-1",
-      modelVersion: "gemini-2.5-flash-image-preview",
+      modelVersion: "gemini-3.8-flash",
       region: "us-central1",
     },
     usage: {

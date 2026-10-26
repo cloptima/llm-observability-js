@@ -1,4 +1,4 @@
-const PACKAGE_VERSION = '0.2.3';
+const PACKAGE_VERSION = '0.3.0';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -49,7 +49,6 @@ export type LLMAttribution = {
   businessOutcomeStatus?: string;
   businessOutcomeSuccess?: boolean;
   businessValueCents?: number;
-  businessOwner?: string;
   workflowStep?: string;
 };
 
@@ -441,7 +440,6 @@ function attributionFromFlatFields(options: Partial<LLMAttribution>): Partial<LL
     businessOutcomeStatus: cleanString(options.businessOutcomeStatus),
     businessOutcomeSuccess: parseBooleanEnv(options.businessOutcomeSuccess),
     businessValueCents: cleanNumber(options.businessValueCents),
-    businessOwner: cleanString(options.businessOwner),
     workflowStep: cleanString(options.workflowStep),
   });
 }
@@ -921,18 +919,39 @@ function accumulateStreamingUsageMap(
   }
 }
 
+// Cache writes as Cloptima bills them: cache_write_5m and cache_write_1h
+// when the response splits them by TTL, and cache_write for any total it does
+// not split. Anthropic reports cache_creation_input_tokens and
+// cache_creation.ephemeral_*; Bedrock reports cacheWriteInputTokens;
+// OpenAI-compatible APIs report cache_write_tokens (or cached_write_tokens
+// and cached_write_token_details) in the prompt details.
+function cacheWriteUsageUnits(usage: unknown, promptDetails?: unknown): Record<string, number> {
+  const creation = nestedRecord(coerceObjectRecord(usage), 'cache_creation');
+  const writeDetails = nestedRecord(coerceObjectRecord(promptDetails), 'cached_write_token_details');
+  const ttl = (suffix: string, ephemeral: string, detail: string) => runtimePositiveUsageUnit(creation, ephemeral)
+    || runtimePositiveUsageUnit(writeDetails, detail)
+    || runtimePositiveUsageUnit(usage, `cache_creation_input_tokens_${suffix}`, `cache_write_input_tokens_${suffix}`)
+    || runtimePositiveUsageUnit(promptDetails, `cache_creation_input_tokens_${suffix}`, `cache_write_input_tokens_${suffix}`)
+    || 0;
+  const fiveMinutes = ttl('5m', 'ephemeral_5m_input_tokens', 'cached_write_tokens_5m');
+  const oneHour = ttl('1h', 'ephemeral_1h_input_tokens', 'cached_write_tokens_1h');
+  const total = runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens', 'cache_write_input_tokens', 'cacheWriteInputTokens')
+    || runtimePositiveUsageUnit(promptDetails, 'cache_write_tokens', 'cached_write_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens')
+    || 0;
+  return { cache_write_5m: fiveMinutes, cache_write_1h: oneHour, cache_write: Math.max(0, total - fiveMinutes - oneHour) };
+}
+
+function cacheWriteTotal(extraUsageUnits: Record<string, number> | undefined): number {
+  return (extraUsageUnits?.cache_write || 0) + (extraUsageUnits?.cache_write_5m || 0) + (extraUsageUnits?.cache_write_1h || 0);
+}
+
 function extractRuntimeExtraUsageUnits(
   usage: Record<string, unknown> | undefined,
   promptDetails?: unknown,
   completionDetails?: unknown,
 ): Record<string, number> | undefined {
   return cleanUsageMap({
-    cache_write: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens', 'cache_write_input_tokens')
-      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens', 'cache_write_input_tokens'),
-    cache_write_5m: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens_5m', 'cache_write_input_tokens_5m')
-      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens_5m', 'cache_write_input_tokens_5m'),
-    cache_write_1h: runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens_1h', 'cache_write_input_tokens_1h')
-      || runtimePositiveUsageUnit(promptDetails, 'cache_creation_input_tokens_1h', 'cache_write_input_tokens_1h'),
+    ...cacheWriteUsageUnits(usage, promptDetails),
     input_image: runtimePositiveUsageUnit(
       usage,
       'input_image_tokens',
@@ -1716,7 +1735,6 @@ function buildPayload(
     business_outcome_status: attribution.businessOutcomeStatus,
     business_outcome_success: attribution.businessOutcomeSuccess,
     business_value_cents: attribution.businessValueCents,
-    business_owner: attribution.businessOwner,
     workflow_step: attribution.workflowStep,
     metadata: stripUndefined({
       ...(sanitizedCustomMetadata || {}),
@@ -2154,7 +2172,10 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
         ...options.attribution,
         ...extracted,
         ...agentEventFields(options.agent),
-        provider: extracted.provider || options.provider,
+        // The provider the caller names wins: an extractor's provider is
+        // the label of its response shape (openai for every
+        // OpenAI-compatible API).
+        provider: options.provider || extracted.provider || '',
         model: extracted.model || options.model,
         requestId: extracted.requestId || options.requestId,
         traceId: extracted.traceId || options.traceId,
@@ -2225,7 +2246,10 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
         ...options.attribution,
         ...extracted,
         ...agentEventFields(options.agent),
-        provider: extracted.provider || options.provider,
+        // The provider the caller names wins: an extractor's provider is
+        // the label of its response shape (openai for every
+        // OpenAI-compatible API).
+        provider: options.provider || extracted.provider || '',
         model: extracted.model || options.model,
         requestId: extracted.requestId || options.requestId,
         traceId: extracted.traceId || options.traceId,
@@ -2392,7 +2416,6 @@ function resolvedInitAttribution(options: InitFromEnvOptions | undefined): Parti
     businessOutcomeStatus: cleanString(options?.defaultAttribution?.businessOutcomeStatus),
     businessOutcomeSuccess: parseBooleanEnv(options?.defaultAttribution?.businessOutcomeSuccess),
     businessValueCents: cleanNumber(options?.defaultAttribution?.businessValueCents),
-    businessOwner: cleanString(options?.defaultAttribution?.businessOwner),
     workflowStep: cleanString(options?.defaultAttribution?.workflowStep),
   });
 }
@@ -2535,22 +2558,44 @@ export function wrapObservedService<TService extends object>(
   return wrapped as TService;
 }
 
+// Responses stream events nest the response object (`response.created`,
+// `response.completed`, `response.incomplete`, `response.failed`); Chat chunks
+// and non-stream responses are the object itself.
+function openAIResponseRecord(value: unknown): Record<string, unknown> | undefined {
+  const record = coerceObjectRecord(value);
+  return (record && nestedRecord(record, 'response')) || record;
+}
+
 export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
-  const record = coerceObjectRecord(response) || {};
+  const record = openAIResponseRecord(response) || {};
   const usage = nestedRecord(record, 'usage') || {};
-  const promptDetails = nestedRecord(usage, 'prompt_tokens_details', 'promptTokensDetails') || {};
-  const completionDetails = nestedRecord(usage, 'completion_tokens_details', 'completionTokensDetails') || {};
+  // Chat names usage prompt/completion; Responses names it input/output.
+  const promptDetails = nestedRecord(usage, 'prompt_tokens_details', 'promptTokensDetails', 'input_tokens_details') || {};
+  const completionDetails = nestedRecord(usage, 'completion_tokens_details', 'completionTokensDetails', 'output_tokens_details') || {};
+  const extraUsageUnits = extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails);
+  // Prompt tokens count cache reads and writes, and completion tokens count
+  // reasoning. The usage convention reports writes as cache_write units and
+  // reasoning outside output.
+  const promptTokens = cleanNumber(usage.prompt_tokens ?? usage.input_tokens);
+  const completionTokens = cleanNumber(usage.completion_tokens ?? usage.output_tokens);
+  const reasoningTokens = cleanNumber(completionDetails.reasoning_tokens);
+  // Except where the total shows completion leaves reasoning out (xAI:
+  // total = prompt + completion + reasoning).
+  const completionExcludesReasoning = Boolean(reasoningTokens)
+    && cleanNumber(usage.total_tokens) === (promptTokens || 0) + (completionTokens || 0) + (reasoningTokens || 0);
 
   return {
     provider: 'openai',
     providerRequestId: cleanString(recordField(record, 'id')),
     model: cleanString(recordField(record, 'model')),
-    inputTokens: cleanNumber(usage.prompt_tokens),
-    outputTokens: cleanNumber(usage.completion_tokens),
+    inputTokens: promptTokens === undefined ? undefined : Math.max(0, promptTokens - cacheWriteTotal(extraUsageUnits)),
+    outputTokens: completionTokens === undefined || completionExcludesReasoning
+      ? completionTokens
+      : Math.max(0, completionTokens - (reasoningTokens || 0)),
     totalTokens: cleanNumber(usage.total_tokens),
-    reasoningTokens: cleanNumber(completionDetails.reasoning_tokens),
+    reasoningTokens,
     cachedInputTokens: cleanNumber(promptDetails.cached_tokens),
-    extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
+    extraUsageUnits,
     cacheHit: cleanNumber(promptDetails.cached_tokens) ? true : undefined,
   };
 }
@@ -2560,7 +2605,7 @@ export function extractOpenAIStreamUsage(chunks: Array<unknown>): Partial<LLMUsa
   let providerRequestId: string | undefined;
   let model: string | undefined;
   for (const chunk of chunks) {
-    const record = coerceObjectRecord(chunk);
+    const record = openAIResponseRecord(chunk);
     if (!record) {
       continue;
     }
@@ -2581,22 +2626,29 @@ export function extractOpenAIStreamUsage(chunks: Array<unknown>): Partial<LLMUsa
   };
 }
 
-export function extractAzureOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
+export function extractAzureUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = coerceObjectRecord(response) || {};
   const extracted = extractOpenAIUsage(response);
   return {
     ...extracted,
-    provider: 'azure_openai',
+    provider: 'azure',
     model: extracted.model || cleanString(recordField(record, 'deployment_name', 'deployment', 'model')),
   };
+}
+
+function withCacheReads(inputTokens: number | undefined, cachedInputTokens: number | undefined): number | undefined {
+  return inputTokens === undefined && cachedInputTokens === undefined ? undefined : (inputTokens || 0) + (cachedInputTokens || 0);
 }
 
 export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = coerceObjectRecord(response) || {};
   const usage = nestedRecord(record, 'usage') || {};
-  const inputTokens = cleanNumber(usage.input_tokens);
   const outputTokens = cleanNumber(usage.output_tokens);
   const cachedInputTokens = cleanNumber(usage.cache_read_input_tokens);
+  // Anthropic's input_tokens counts neither cache reads nor writes. Cloptima
+  // counts reads in input (billed at the cached rate) and bills writes as
+  // cache_write units.
+  const inputTokens = withCacheReads(cleanNumber(usage.input_tokens), cachedInputTokens);
   return {
     provider: 'anthropic',
     providerRequestId: cleanString(recordField(record, 'id')),
@@ -2615,60 +2667,50 @@ export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent>
   };
 }
 
+// Stream counters are cumulative, and Anthropic splits cache writes by TTL
+// only in message_start (message_delta repeats the totals without the split).
+// Merging keeps each field's largest value, so the merged usage reads like
+// the unstreamed response's.
+function mergeStreamUsage(previous: Record<string, unknown> | undefined, next: Record<string, unknown>): Record<string, unknown> {
+  if (!previous) {
+    return next;
+  }
+  const merged: Record<string, unknown> = { ...previous };
+  for (const [key, value] of Object.entries(next)) {
+    const prior = merged[key];
+    const priorRecord = coerceObjectRecord(prior);
+    const valueRecord = coerceObjectRecord(value);
+    if (typeof value === 'number' && typeof prior === 'number') {
+      merged[key] = Math.max(prior, value);
+    } else if (valueRecord && priorRecord) {
+      merged[key] = mergeStreamUsage(priorRecord, valueRecord);
+    } else if (value !== null && value !== undefined) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
 export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
   let providerRequestId: string | undefined;
   let model: string | undefined;
-  let inputTokens: number | undefined;
-  let outputTokens: number | undefined;
-  let cachedInputTokens: number | undefined;
-  let lastInputTokens: number | undefined;
-  let lastOutputTokens: number | undefined;
-  let lastCachedInputTokens: number | undefined;
-  const extraUsageUnits: Record<string, number> = {};
-  const lastExtraUsageUnits: Record<string, number> = {};
+  let usage: Record<string, unknown> | undefined;
   for (const chunk of chunks) {
     const record = coerceObjectRecord(chunk);
     if (!record) {
       continue;
     }
-    let usage: Record<string, unknown> = {};
     const message = nestedRecord(record, 'message');
     if (message) {
       providerRequestId = cleanString(recordField(message, 'id')) || providerRequestId;
       model = cleanString(recordField(message, 'model')) || model;
-      usage = nestedRecord(message, 'usage') || {};
-    } else {
-      usage = nestedRecord(record, 'usage') || {};
     }
-    ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(
-      inputTokens,
-      lastInputTokens,
-      cleanNumber(usage.input_tokens),
-    ));
-    ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(
-      outputTokens,
-      lastOutputTokens,
-      cleanNumber(usage.output_tokens),
-    ));
-    ({ total: cachedInputTokens, lastSeen: lastCachedInputTokens } = accumulateStreamingCounter(
-      cachedInputTokens,
-      lastCachedInputTokens,
-      cleanNumber(usage.cache_read_input_tokens),
-    ));
-    accumulateStreamingUsageMap(extraUsageUnits, lastExtraUsageUnits, extractRuntimeExtraUsageUnits(usage));
+    const chunkUsage = nestedRecord(message || record, 'usage');
+    if (chunkUsage) {
+      usage = mergeStreamUsage(usage, chunkUsage);
+    }
   }
-  const totalTokens = inputTokens !== undefined || outputTokens !== undefined ? (inputTokens || 0) + (outputTokens || 0) : undefined;
-  return {
-    provider: 'anthropic',
-    providerRequestId,
-    model,
-    inputTokens,
-    outputTokens,
-    totalTokens,
-    cachedInputTokens,
-    extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
-    cacheHit: cachedInputTokens ? true : undefined,
-  };
+  return { ...extractAnthropicUsage({ usage: usage || {} }), providerRequestId, model };
 }
 
 export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
@@ -2738,13 +2780,16 @@ export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
   const metadata = nestedRecord(record, 'ResponseMetadata') || {};
   const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
   const completionDetails = recordField(usage, 'completionTokensDetails', 'completion_tokens_details', 'outputTokensDetails', 'output_tokens_details');
+  // Bedrock's inputTokens counts neither cache reads nor writes, as Anthropic's.
+  const cachedInputTokens = cleanNumber(recordField(usage, 'cacheReadInputTokens', 'cache_read_input_tokens'));
   return {
     provider: 'bedrock',
     providerRequestId: cleanString(recordField(record, 'requestId', 'request_id')) || cleanString(recordField(metadata, 'RequestId')),
     model: cleanString(recordField(record, 'modelId', 'model_id', 'model')),
-    inputTokens: cleanNumber(recordField(usage, 'inputTokens', 'input_tokens')),
+    inputTokens: withCacheReads(cleanNumber(recordField(usage, 'inputTokens', 'input_tokens')), cachedInputTokens),
     outputTokens: cleanNumber(recordField(usage, 'outputTokens', 'output_tokens')),
     totalTokens: cleanNumber(recordField(usage, 'totalTokens', 'total_tokens')),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens, cacheHit: cachedInputTokens > 0 || undefined } : {}),
     extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
     latencyMs: cleanNumber(recordField(metrics, 'latencyMs', 'latency_ms')),
   };
@@ -2760,8 +2805,10 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
   let model: string | undefined;
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
+  let cachedInputTokens: number | undefined;
   let lastInputTokens: number | undefined;
   let lastOutputTokens: number | undefined;
+  let lastCachedInputTokens: number | undefined;
   let totalTokens: number | undefined;
   const extraUsageUnits: Record<string, number> = {};
   const lastExtraUsageUnits: Record<string, number> = {};
@@ -2789,6 +2836,11 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
     ) || {};
     ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(inputTokens, lastInputTokens, input));
     ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(outputTokens, lastOutputTokens, output));
+    ({ total: cachedInputTokens, lastSeen: lastCachedInputTokens } = accumulateStreamingCounter(
+      cachedInputTokens,
+      lastCachedInputTokens,
+      cleanNumber(recordField(usage, 'cacheReadInputTokens', 'cache_read_input_tokens')),
+    ));
     if (input !== undefined || output !== undefined || Object.keys(chunkExtraUsageUnits).length > 0) {
       sawUsage = true;
     }
@@ -2799,9 +2851,10 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
     provider: 'bedrock',
     providerRequestId,
     model,
-    inputTokens: sawUsage ? inputTokens : undefined,
+    inputTokens: sawUsage ? withCacheReads(inputTokens, cachedInputTokens) : undefined,
     outputTokens: sawUsage ? outputTokens : undefined,
-    totalTokens: totalTokens ?? (sawUsage ? (inputTokens || 0) + (outputTokens || 0) : undefined),
+    totalTokens: totalTokens ?? (sawUsage ? (withCacheReads(inputTokens, cachedInputTokens) || 0) + (outputTokens || 0) : undefined),
+    ...(sawUsage && cachedInputTokens !== undefined ? { cachedInputTokens, cacheHit: cachedInputTokens > 0 || undefined } : {}),
     extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
   };
 }
@@ -2814,12 +2867,12 @@ export const PROVIDER_USAGE_EXTRACTORS: ReadonlyArray<Readonly<ProviderUsageExtr
     streamExtractor: extractOpenAIStreamUsage,
   }),
   Object.freeze({
-    provider: 'azure_openai',
-    aliases: Object.freeze(['azure_openai', 'azure-openai', 'azure']),
-    responseExtractor: extractAzureOpenAIUsage,
+    provider: 'azure',
+    aliases: Object.freeze(['azure']),
+    responseExtractor: extractAzureUsage,
     streamExtractor: (chunks: unknown[]) => ({
       ...extractOpenAIStreamUsage(chunks),
-      provider: 'azure_openai',
+      provider: 'azure',
     }),
   }),
   Object.freeze({
@@ -2882,25 +2935,24 @@ export function listSupportedProviders(): ProviderSupportMatrixEntry[] {
   }));
 }
 
-function normalizeOpenAICompatibleProvider(provider?: string): 'openai' | 'azure_openai' {
-  const normalized = cleanString(provider)?.toLowerCase();
-  if (normalized === 'azure_openai' || normalized === 'azure-openai' || normalized === 'azure') {
-    return 'azure_openai';
-  }
-  return 'openai';
+// The provider the caller names is reported as named, never relabeled: the
+// server resolves it through the catalog's provider aliases. Only an unnamed
+// provider defaults to openai.
+function normalizeOpenAICompatibleProvider(provider?: string): string {
+  return cleanString(provider)?.toLowerCase() || 'openai';
 }
 
 function selectOpenAICompatibleResponseExtractor(provider?: string): (response: Record<string, unknown>) => Partial<LLMUsageEvent> {
-  return normalizeOpenAICompatibleProvider(provider) === 'azure_openai'
-    ? extractAzureOpenAIUsage
+  return normalizeOpenAICompatibleProvider(provider) === 'azure'
+    ? extractAzureUsage
     : extractOpenAIUsage;
 }
 
 function selectOpenAICompatibleStreamExtractor(provider?: string): (chunks: Array<Record<string, unknown>>) => Partial<LLMUsageEvent> {
-  if (normalizeOpenAICompatibleProvider(provider) === 'azure_openai') {
+  if (normalizeOpenAICompatibleProvider(provider) === 'azure') {
     return (chunks) => ({
       ...extractOpenAIStreamUsage(chunks),
-      provider: 'azure_openai',
+      provider: 'azure',
     });
   }
   return extractOpenAIStreamUsage;
@@ -2921,7 +2973,7 @@ function buildOpenAICompatibleInstrumentationEvent<TResponse extends Record<stri
     ...options.attribution,
     ...extracted,
     ...agentEventFields(options.agent),
-    provider: extracted.provider || provider,
+    provider,
     model: extracted.model || options.model || cleanString(resolved.model) || 'unknown',
     requestId: extracted.requestId || options.requestId,
     traceId: extracted.traceId || options.traceId,
