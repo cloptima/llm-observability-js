@@ -1,4 +1,4 @@
-const PACKAGE_VERSION = '0.3.0';
+const PACKAGE_VERSION = '0.4.0';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -2566,13 +2566,23 @@ function openAIResponseRecord(value: unknown): Record<string, unknown> | undefin
   return (record && nestedRecord(record, 'response')) || record;
 }
 
+// Conduit reports web searches as tool_usage.web_search.num_requests: inside
+// usage on chat completions, at the response root on Responses.
+// num_search_queries in the token details is not this count.
+function conduitWebSearchRequests(record: Record<string, unknown> | undefined): number | undefined {
+  return runtimePositiveUsageUnit(nestedRecord(nestedRecord(record, 'tool_usage'), 'web_search'), 'num_requests');
+}
+
 export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = openAIResponseRecord(response) || {};
   const usage = nestedRecord(record, 'usage') || {};
   // Chat names usage prompt/completion; Responses names it input/output.
   const promptDetails = nestedRecord(usage, 'prompt_tokens_details', 'promptTokensDetails', 'input_tokens_details') || {};
   const completionDetails = nestedRecord(usage, 'completion_tokens_details', 'completionTokensDetails', 'output_tokens_details') || {};
-  const extraUsageUnits = extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails);
+  const extraUsageUnits = cleanUsageMap({
+    search_request: conduitWebSearchRequests(usage) || conduitWebSearchRequests(record),
+    ...extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
+  });
   // Prompt tokens count cache reads and writes, and completion tokens count
   // reasoning. The usage convention reports writes as cache_write units and
   // reasoning outside output.
@@ -2659,9 +2669,11 @@ export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent>
       inputTokens !== undefined || outputTokens !== undefined ? (inputTokens || 0) + (outputTokens || 0) : undefined
     ),
     cachedInputTokens,
+    // server_tool_use counts each server tool; only web searches bill as
+    // search_request (a web fetch is not a search).
     extraUsageUnits: cleanUsageMap({
+      search_request: runtimePositiveUsageUnit(nestedRecord(usage, 'server_tool_use'), 'web_search_requests'),
       ...extractRuntimeExtraUsageUnits(usage),
-      server_tool_use: usage.server_tool_use,
     }),
     cacheHit: cachedInputTokens ? true : undefined,
   };
