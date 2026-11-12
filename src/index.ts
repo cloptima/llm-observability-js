@@ -1,4 +1,4 @@
-const PACKAGE_VERSION = '0.4.0';
+const PACKAGE_VERSION = '0.5.0';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
@@ -116,6 +116,15 @@ async function createAttributionContextStorage(): Promise<AttributionContextStor
 
 const attributionContextStorage = await createAttributionContextStorage();
 
+/** One advisor model's passes, as the usage convention sends them (`advisor_usage`). */
+export type AdvisorUsageEntry = {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens?: number;
+  extra_usage_units?: Record<string, number>;
+};
+
 export type LLMUsage = {
   inputTokens?: number;
   outputTokens?: number;
@@ -123,6 +132,8 @@ export type LLMUsage = {
   reasoningTokens?: number;
   cachedInputTokens?: number;
   extraUsageUnits?: Record<string, number>;
+  /** Anthropic advisor passes, billed at each advisor model's rates outside the request's own tokens. */
+  advisorUsage?: AdvisorUsageEntry[];
   cacheHit?: boolean;
 };
 
@@ -919,39 +930,69 @@ function accumulateStreamingUsageMap(
   }
 }
 
-// Cache writes as Cloptima bills them: cache_write_5m and cache_write_1h
-// when the response splits them by TTL, and cache_write for any total it does
-// not split. Anthropic reports cache_creation_input_tokens and
-// cache_creation.ephemeral_*; Bedrock reports cacheWriteInputTokens;
-// OpenAI-compatible APIs report cache_write_tokens (or cached_write_tokens
-// and cached_write_token_details) in the prompt details.
-function cacheWriteUsageUnits(usage: unknown, promptDetails?: unknown): Record<string, number> {
-  const creation = nestedRecord(coerceObjectRecord(usage), 'cache_creation');
-  const writeDetails = nestedRecord(coerceObjectRecord(promptDetails), 'cached_write_token_details');
-  const ttl = (suffix: string, ephemeral: string, detail: string) => runtimePositiveUsageUnit(creation, ephemeral)
-    || runtimePositiveUsageUnit(writeDetails, detail)
-    || runtimePositiveUsageUnit(usage, `cache_creation_input_tokens_${suffix}`, `cache_write_input_tokens_${suffix}`)
-    || runtimePositiveUsageUnit(promptDetails, `cache_creation_input_tokens_${suffix}`, `cache_write_input_tokens_${suffix}`)
-    || 0;
-  const fiveMinutes = ttl('5m', 'ephemeral_5m_input_tokens', 'cached_write_tokens_5m');
-  const oneHour = ttl('1h', 'ephemeral_1h_input_tokens', 'cached_write_tokens_1h');
+// The fields that split cache writes by lifetime (a count and s, m, h or d),
+// each with the pattern that names its TTL, in precedence order: Anthropic
+// cache_creation.ephemeral_<ttl>_input_tokens, Conduit
+// cached_write_token_details.cached_write_tokens_<ttl>, OpenAI
+// cache_write_tokens_details.ttl_<ttl>_tokens, and flat
+// cache_creation_input_tokens_<ttl> or cache_write_input_tokens_<ttl>.
+const CACHE_WRITE_SPLITS: Array<{ in: 'usage' | 'prompt'; detail?: string; pattern: RegExp }> = [
+  { in: 'usage', detail: 'cache_creation', pattern: /^ephemeral_(\d+[smhd])_input_tokens$/ },
+  { in: 'prompt', detail: 'cached_write_token_details', pattern: /^cached_write_tokens_(\d+[smhd])$/ },
+  { in: 'prompt', detail: 'cache_write_tokens_details', pattern: /^ttl_(\d+[smhd])_tokens$/ },
+  { in: 'usage', pattern: /^cache_(?:creation|write)_input_tokens_(\d+[smhd])$/ },
+  { in: 'prompt', pattern: /^cache_(?:creation|write)_input_tokens_(\d+[smhd])$/ },
+];
+
+// The lifetime a response says it cached at: the Responses API echoes the
+// request's prompt_cache_options.
+function servedCacheTtl(record: unknown): string | undefined {
+  const ttl = nestedRecord(coerceObjectRecord(record), 'prompt_cache_options')?.ttl;
+  return typeof ttl === 'string' && /^\d+[smhd]$/.test(ttl) ? ttl : undefined;
+}
+
+// Cache writes as Cloptima bills them: cache_write_<ttl> for each lifetime
+// the response splits out, and the rest of the total at the lifetime the
+// response says it cached at, else as cache_write (the default lifetime).
+// Anthropic reports cache_creation_input_tokens; Bedrock reports
+// cacheWriteInputTokens; OpenAI-compatible APIs report cache_write_tokens (or
+// cached_write_tokens) in the prompt details.
+function cacheWriteUsageUnits(usage: unknown, promptDetails?: unknown, servedTtl?: string): Record<string, number> {
+  const units: Record<string, number> = {};
+  for (const split of CACHE_WRITE_SPLITS) {
+    const root = coerceObjectRecord(split.in === 'usage' ? usage : promptDetails);
+    const source = split.detail ? nestedRecord(root, split.detail) : root;
+    for (const key of Object.keys(source || {}).sort()) {
+      const ttl = split.pattern.exec(key)?.[1];
+      const count = ttl ? runtimePositiveUsageUnit(source, key) || 0 : 0;
+      if (ttl && count > 0 && units[`cache_write_${ttl}`] === undefined) units[`cache_write_${ttl}`] = count;
+    }
+  }
+  const split = Object.values(units).reduce((sum, count) => sum + count, 0);
   const total = runtimePositiveUsageUnit(usage, 'cache_creation_input_tokens', 'cache_write_input_tokens', 'cacheWriteInputTokens')
     || runtimePositiveUsageUnit(promptDetails, 'cache_write_tokens', 'cached_write_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens')
     || 0;
-  return { cache_write_5m: fiveMinutes, cache_write_1h: oneHour, cache_write: Math.max(0, total - fiveMinutes - oneHour) };
+  if (total > split) {
+    const rest = servedTtl ? `cache_write_${servedTtl}` : 'cache_write';
+    units[rest] = (units[rest] || 0) + total - split;
+  }
+  return units;
 }
 
+// Cache-write units in usage, every lifetime.
 function cacheWriteTotal(extraUsageUnits: Record<string, number> | undefined): number {
-  return (extraUsageUnits?.cache_write || 0) + (extraUsageUnits?.cache_write_5m || 0) + (extraUsageUnits?.cache_write_1h || 0);
+  return Object.entries(extraUsageUnits || {})
+    .reduce((sum, [key, value]) => sum + (key === 'cache_write' || key.startsWith('cache_write_') ? value : 0), 0);
 }
 
 function extractRuntimeExtraUsageUnits(
   usage: Record<string, unknown> | undefined,
   promptDetails?: unknown,
   completionDetails?: unknown,
+  servedTtl?: string,
 ): Record<string, number> | undefined {
   return cleanUsageMap({
-    ...cacheWriteUsageUnits(usage, promptDetails),
+    ...cacheWriteUsageUnits(usage, promptDetails, servedTtl),
     input_image: runtimePositiveUsageUnit(
       usage,
       'input_image_tokens',
@@ -1723,6 +1764,7 @@ function buildPayload(
     reasoning_tokens: cleanNumber(event.reasoningTokens),
     cached_input_tokens: cleanNumber(event.cachedInputTokens),
     extra_usage_units: cleanUsageMap(event.extraUsageUnits),
+    advisor_usage: event.advisorUsage?.length ? event.advisorUsage : undefined,
     cache_hit: event.cacheHit,
     vendor_reported_cost_usd: event.vendorReportedCostUsd,
     started_at: toIso(event.startedAt),
@@ -2573,6 +2615,22 @@ function conduitWebSearchRequests(record: Record<string, unknown> | undefined): 
   return runtimePositiveUsageUnit(nestedRecord(nestedRecord(record, 'tool_usage'), 'web_search'), 'num_requests');
 }
 
+// Conduit's chat completions usage counts the code-execution container
+// sessions a response started as tool_usage.container_sessions (memory tier to
+// sessions). Each tier is one unit: container_session for the default tier
+// (default, 1g), and container_session_<tier> for a larger one.
+function conduitContainerSessionUnits(usage: Record<string, unknown> | undefined): Record<string, number> {
+  const units: Record<string, number> = {};
+  for (const [tier, value] of Object.entries(nestedRecord(nestedRecord(usage, 'tool_usage'), 'container_sessions') || {})) {
+    const sessions = cleanNumber(value);
+    if (!sessions) continue;
+    const name = tier.trim().toLowerCase();
+    const unit = /^\d+g$/.test(name) && name !== '1g' ? `container_session_${name}` : 'container_session';
+    units[unit] = (units[unit] || 0) + sessions;
+  }
+  return units;
+}
+
 export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = openAIResponseRecord(response) || {};
   const usage = nestedRecord(record, 'usage') || {};
@@ -2581,7 +2639,8 @@ export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
   const completionDetails = nestedRecord(usage, 'completion_tokens_details', 'completionTokensDetails', 'output_tokens_details') || {};
   const extraUsageUnits = cleanUsageMap({
     search_request: conduitWebSearchRequests(usage) || conduitWebSearchRequests(record),
-    ...extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
+    ...extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails, servedCacheTtl(record)),
+    ...conduitContainerSessionUnits(usage),
   });
   // Prompt tokens count cache reads and writes, and completion tokens count
   // reasoning. The usage convention reports writes as cache_write units and
@@ -2650,6 +2709,27 @@ function withCacheReads(inputTokens: number | undefined, cachedInputTokens: numb
   return inputTokens === undefined && cachedInputTokens === undefined ? undefined : (inputTokens || 0) + (cachedInputTokens || 0);
 }
 
+// Anthropic reports each advisor pass in usage.iterations, outside the
+// top-level totals, which count the executor only. Summed per advisor model.
+function anthropicAdvisorUsage(usage: Record<string, unknown>): AdvisorUsageEntry[] | undefined {
+  const byModel = new Map<string, AdvisorUsageEntry>();
+  for (const pass of Array.isArray(usage.iterations) ? usage.iterations : []) {
+    const record = coerceObjectRecord(pass);
+    const model = cleanString(record?.model);
+    if (!record || record.type !== 'advisor_message' || !model) continue;
+    const measured = extractAnthropicUsage({ usage: record });
+    const entry = byModel.get(model) || { model, input_tokens: 0, output_tokens: 0 };
+    entry.input_tokens += measured.inputTokens || 0;
+    entry.output_tokens += measured.outputTokens || 0;
+    if (measured.cachedInputTokens) entry.cached_input_tokens = (entry.cached_input_tokens || 0) + measured.cachedInputTokens;
+    for (const [unit, count] of Object.entries(measured.extraUsageUnits || {})) {
+      entry.extra_usage_units = { ...entry.extra_usage_units, [unit]: (entry.extra_usage_units?.[unit] || 0) + count };
+    }
+    byModel.set(model, entry);
+  }
+  return byModel.size > 0 ? [...byModel.values()] : undefined;
+}
+
 export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent> {
   const record = coerceObjectRecord(response) || {};
   const usage = nestedRecord(record, 'usage') || {};
@@ -2659,6 +2739,7 @@ export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent>
   // counts reads in input (billed at the cached rate) and bills writes as
   // cache_write units.
   const inputTokens = withCacheReads(cleanNumber(usage.input_tokens), cachedInputTokens);
+  const advisorUsage = anthropicAdvisorUsage(usage);
   return {
     provider: 'anthropic',
     providerRequestId: cleanString(recordField(record, 'id')),
@@ -2675,6 +2756,7 @@ export function extractAnthropicUsage(response: unknown): Partial<LLMUsageEvent>
       search_request: runtimePositiveUsageUnit(nestedRecord(usage, 'server_tool_use'), 'web_search_requests'),
       ...extractRuntimeExtraUsageUnits(usage),
     }),
+    ...(advisorUsage ? { advisorUsage } : {}),
     cacheHit: cachedInputTokens ? true : undefined,
   };
 }
@@ -2731,6 +2813,9 @@ export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
   const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
   const completionDetails = recordField(usage, 'candidatesTokensDetails', 'candidates_tokens_details', 'responseTokensDetails', 'response_tokens_details', 'outputTokensDetails', 'output_tokens_details');
   const cachedInputTokens = cleanNumber(recordField(usage, 'cachedContentTokenCount', 'cached_content_token_count'));
+  // The audio inside the cached tokens, which Google bills at its own rate.
+  const cachedInputAudio = detailModalityTokenCount(recordField(usage, 'cacheTokensDetails', 'cache_tokens_details'), 'audio');
+  const extraUsageUnits = extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails);
   return {
     provider: cleanString(recordField(record, 'provider')) || 'gemini',
     providerRequestId: cleanString(recordField(record, 'responseId', 'response_id', 'id', 'name')),
@@ -2740,7 +2825,7 @@ export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
     totalTokens: cleanNumber(recordField(usage, 'totalTokenCount', 'total_token_count')),
     reasoningTokens: cleanNumber(recordField(usage, 'thoughtsTokenCount', 'thoughts_token_count', 'reasoningTokenCount', 'reasoning_token_count')),
     cachedInputTokens,
-    extraUsageUnits: extractRuntimeExtraUsageUnits(usage, promptDetails, completionDetails),
+    extraUsageUnits: cachedInputAudio ? { ...extraUsageUnits, cached_input_audio: cachedInputAudio } : extraUsageUnits,
     cacheHit: cachedInputTokens ? true : undefined,
   };
 }

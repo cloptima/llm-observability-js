@@ -79,6 +79,7 @@ function camelExpected(expected) {
     reasoningTokens: expected.reasoning_tokens,
     cachedInputTokens: expected.cached_input_tokens,
     extraUsageUnits: expected.extra_usage_units,
+    advisorUsage: expected.advisor_usage,
     cacheHit: expected.cache_hit,
     latencyMs: expected.latency_ms,
   };
