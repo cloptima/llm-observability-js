@@ -1,7 +1,14 @@
-const PACKAGE_VERSION = '0.5.0';
+const PACKAGE_VERSION = '0.6.0';
 export type CloptimaFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 export type LLMObservabilityDeliveryMode = 'cloptima_http' | 'otlp_http';
 export type LLMUsageExtractor<T = unknown> = (input: T) => Partial<LLMUsageEvent>;
+// Folds a stream's usage one chunk at a time, so no chunk has to be kept.
+// add is a function property, not a method, so a stream's chunk type is
+// inferred from its call and never widened by the accumulator.
+export type LLMStreamUsageAccumulator<TChunk = unknown> = {
+  add: (chunk: TChunk) => void;
+  result: () => Partial<LLMUsageEvent>;
+};
 export type UsageFieldPath = string;
 export type UsageFieldPaths = UsageFieldPath | UsageFieldPath[];
 export type ProviderUsageExtractorDescriptor = {
@@ -9,6 +16,7 @@ export type ProviderUsageExtractorDescriptor = {
   aliases: readonly string[];
   responseExtractor: LLMUsageExtractor<unknown>;
   streamExtractor?: LLMUsageExtractor<unknown[]>;
+  streamUsageAccumulator?: () => LLMStreamUsageAccumulator;
 };
 export type MappedUsageExtractorConfig = {
   defaults?: Partial<LLMUsageEvent>;
@@ -254,7 +262,7 @@ export type ObserveLLMStreamOptions<TChunk> = {
   provider: string;
   model: string;
   call: () => AsyncIterable<TChunk> | Iterable<TChunk> | Promise<AsyncIterable<TChunk> | Iterable<TChunk>>;
-  extractUsage?: (chunks: TChunk[]) => Partial<LLMUsageEvent>;
+  usageAccumulator?: () => LLMStreamUsageAccumulator<TChunk>;
   attribution?: Partial<LLMAttribution>;
   agent?: Partial<LLMAgentContext>;
   metadata?: Record<string, unknown>;
@@ -262,7 +270,6 @@ export type ObserveLLMStreamOptions<TChunk> = {
   requestId?: string;
   traceId?: string;
   fireAndForget?: boolean;
-  maxBufferedChunks?: number;
 };
 
 export type ObserveCallOptions<T> = ObserveLLMCallOptions<T> & Partial<LLMAttribution>;
@@ -300,10 +307,6 @@ export type OpenAICompatibleInstrumentationOptions = {
   requestId?: string;
   traceId?: string;
   fireAndForget?: boolean;
-};
-
-export type OpenAICompatibleStreamInstrumentationOptions = OpenAICompatibleInstrumentationOptions & {
-  maxBufferedChunks?: number;
 };
 
 export type RequestContextOptions = {
@@ -631,39 +634,64 @@ function mergeObservedStreamOptions<TChunk>(
   };
 }
 
-function maxBufferedChunks(value: number | undefined): number {
-  if (value === undefined) {
-    return 256;
+// Telemetry never breaks the stream: the first accumulator error stops
+// accumulation and goes to onError, and the event carries no usage. An onError
+// that throws must not reach the stream either. The fold is synchronous: an
+// async factory, add, or result is an error, and its promise is absorbed so a
+// rejection is never unhandled.
+function guardStreamUsage<TChunk>(
+  createAccumulator: (() => LLMStreamUsageAccumulator<TChunk>) | undefined,
+  onError: (error: unknown) => void,
+): LLMStreamUsageAccumulator<TChunk> {
+  let accumulator: LLMStreamUsageAccumulator<TChunk> | undefined;
+  const fail = (error: unknown) => {
+    accumulator = undefined;
+    try {
+      onError(error);
+    } catch {
+      // The stream outranks the caller's error hook.
+    }
+  };
+  const rejectPromise = (value: unknown, step: string) => {
+    if (isPromiseLike(value)) {
+      Promise.resolve(value).catch(() => undefined);
+      throw new TypeError(`usage accumulator ${step} must be synchronous`);
+    }
+  };
+  try {
+    const created: unknown = createAccumulator?.();
+    rejectPromise(created, 'factory');
+    accumulator = created as LLMStreamUsageAccumulator<TChunk> | undefined;
+  } catch (error) {
+    fail(error);
   }
-  return Math.max(1, Math.min(10000, Math.trunc(value)));
+  return {
+    add(chunk) {
+      try {
+        rejectPromise(accumulator?.add(chunk), 'add()');
+      } catch (error) {
+        fail(error);
+      }
+    },
+    result() {
+      try {
+        const extracted: unknown = accumulator?.result();
+        rejectPromise(extracted, 'result()');
+        return (extracted as Partial<LLMUsageEvent> | undefined) || {};
+      } catch (error) {
+        fail(error);
+        return {};
+      }
+    },
+  };
 }
 
-class BufferedChunks<T> {
-  private readonly chunks: T[] = [];
-  private readonly capacity: number;
-  private nextIndex = 0;
-  private count = 0;
-
-  constructor(maxChunks: number) {
-    this.capacity = maxBufferedChunks(maxChunks);
+function foldStreamUsage(createAccumulator: () => LLMStreamUsageAccumulator, chunks: Iterable<unknown>): Partial<LLMUsageEvent> {
+  const accumulator = createAccumulator();
+  for (const chunk of chunks) {
+    accumulator.add(chunk);
   }
-
-  push(chunk: T): void {
-    if (this.count < this.capacity) {
-      this.chunks.push(chunk);
-      this.count += 1;
-      return;
-    }
-    this.chunks[this.nextIndex] = chunk;
-    this.nextIndex = (this.nextIndex + 1) % this.capacity;
-  }
-
-  values(): T[] {
-    if (this.count < this.capacity) {
-      return this.chunks.slice();
-    }
-    return [...this.chunks.slice(this.nextIndex), ...this.chunks.slice(0, this.nextIndex)];
-  }
+  return accumulator.result();
 }
 
 function toIso(value?: Date | string): string | undefined {
@@ -2261,29 +2289,25 @@ export class CloptimaLLMObservability implements LLMObservabilityClient {
 
   async *observeStream<TChunk>(options: ObserveLLMStreamOptions<TChunk>): AsyncGenerator<TChunk, void, unknown> {
     const startedAt = new Date();
-    const chunks = new BufferedChunks<TChunk>(maxBufferedChunks(options.maxBufferedChunks));
+    const usage = guardStreamUsage(options.usageAccumulator, (error) => this.reportObserveError(error));
     let emittedChunks = 0;
     try {
       const stream = await options.call();
       if ((stream as AsyncIterable<TChunk>)[Symbol.asyncIterator]) {
         for await (const chunk of stream as AsyncIterable<TChunk>) {
           emittedChunks += 1;
-          if (options.extractUsage) {
-            chunks.push(chunk);
-          }
+          usage.add(chunk);
           yield chunk;
         }
       } else {
         for (const chunk of stream as Iterable<TChunk>) {
           emittedChunks += 1;
-          if (options.extractUsage) {
-            chunks.push(chunk);
-          }
+          usage.add(chunk);
           yield chunk;
         }
       }
       const completedAt = new Date();
-      const extracted = options.extractUsage ? options.extractUsage(chunks.values()) : {};
+      const extracted = usage.result();
       const event: LLMUsageEvent = {
         ...options.attribution,
         ...extracted,
@@ -2669,29 +2693,45 @@ export function extractOpenAIUsage(response: unknown): Partial<LLMUsageEvent> {
   };
 }
 
-export function extractOpenAIStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+export function createOpenAIStreamUsageAccumulator(): LLMStreamUsageAccumulator {
   let lastWithUsage: Record<string, unknown> | undefined;
   let providerRequestId: string | undefined;
   let model: string | undefined;
-  for (const chunk of chunks) {
-    const record = openAIResponseRecord(chunk);
-    if (!record) {
-      continue;
-    }
-    providerRequestId = cleanString(recordField(record, 'id')) || providerRequestId;
-    model = cleanString(recordField(record, 'model')) || model;
-    if (nestedRecord(record, 'usage')) {
-      lastWithUsage = record;
-    }
-  }
-  if (!lastWithUsage) {
-    return { providerRequestId, model };
-  }
-  const extracted = extractOpenAIUsage(lastWithUsage);
   return {
-    ...extracted,
-    providerRequestId: extracted.providerRequestId || providerRequestId,
-    model: extracted.model || model,
+    add(chunk) {
+      const record = openAIResponseRecord(chunk);
+      if (!record) {
+        return;
+      }
+      providerRequestId = cleanString(recordField(record, 'id')) || providerRequestId;
+      model = cleanString(recordField(record, 'model')) || model;
+      if (nestedRecord(record, 'usage')) {
+        lastWithUsage = record;
+      }
+    },
+    result() {
+      if (!lastWithUsage) {
+        return { providerRequestId, model };
+      }
+      const extracted = extractOpenAIUsage(lastWithUsage);
+      return {
+        ...extracted,
+        providerRequestId: extracted.providerRequestId || providerRequestId,
+        model: extracted.model || model,
+      };
+    },
+  };
+}
+
+export function extractOpenAIStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+  return foldStreamUsage(createOpenAIStreamUsageAccumulator, chunks);
+}
+
+function createAzureStreamUsageAccumulator(): LLMStreamUsageAccumulator {
+  const openAI = createOpenAIStreamUsageAccumulator();
+  return {
+    add: openAI.add,
+    result: () => ({ ...openAI.result(), provider: 'azure' }),
   };
 }
 
@@ -2785,26 +2825,34 @@ function mergeStreamUsage(previous: Record<string, unknown> | undefined, next: R
   return merged;
 }
 
-export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+export function createAnthropicStreamUsageAccumulator(): LLMStreamUsageAccumulator {
   let providerRequestId: string | undefined;
   let model: string | undefined;
   let usage: Record<string, unknown> | undefined;
-  for (const chunk of chunks) {
-    const record = coerceObjectRecord(chunk);
-    if (!record) {
-      continue;
-    }
-    const message = nestedRecord(record, 'message');
-    if (message) {
-      providerRequestId = cleanString(recordField(message, 'id')) || providerRequestId;
-      model = cleanString(recordField(message, 'model')) || model;
-    }
-    const chunkUsage = nestedRecord(message || record, 'usage');
-    if (chunkUsage) {
-      usage = mergeStreamUsage(usage, chunkUsage);
-    }
-  }
-  return { ...extractAnthropicUsage({ usage: usage || {} }), providerRequestId, model };
+  return {
+    add(chunk) {
+      const record = coerceObjectRecord(chunk);
+      if (!record) {
+        return;
+      }
+      const message = nestedRecord(record, 'message');
+      if (message) {
+        providerRequestId = cleanString(recordField(message, 'id')) || providerRequestId;
+        model = cleanString(recordField(message, 'model')) || model;
+      }
+      const chunkUsage = nestedRecord(message || record, 'usage');
+      if (chunkUsage) {
+        usage = mergeStreamUsage(usage, chunkUsage);
+      }
+    },
+    result() {
+      return { ...extractAnthropicUsage({ usage: usage || {} }), providerRequestId, model };
+    },
+  };
+}
+
+export function extractAnthropicStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+  return foldStreamUsage(createAnthropicStreamUsageAccumulator, chunks);
 }
 
 export function extractGeminiUsage(response: unknown): Partial<LLMUsageEvent> {
@@ -2837,37 +2885,50 @@ export function extractVertexUsage(response: unknown): Partial<LLMUsageEvent> {
   };
 }
 
-export function extractGeminiStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+export function createGeminiStreamUsageAccumulator(): LLMStreamUsageAccumulator {
   let lastWithUsage: Record<string, unknown> | undefined;
   let providerRequestId: string | undefined;
   let model: string | undefined;
-  for (const chunk of chunks) {
-    const record = coerceObjectRecord(chunk);
-    if (!record) {
-      continue;
-    }
-    providerRequestId = cleanString(recordField(record, 'responseId', 'response_id', 'id', 'name')) || providerRequestId;
-    model = cleanString(recordField(record, 'modelVersion', 'model_version', 'model')) || model;
-    if (nestedRecord(record, 'usageMetadata', 'usage_metadata')) {
-      lastWithUsage = record;
-    }
-  }
-  if (!lastWithUsage) {
-    return { provider: 'gemini', providerRequestId, model };
-  }
-  const extracted = extractGeminiUsage(lastWithUsage);
   return {
-    ...extracted,
-    providerRequestId: extracted.providerRequestId || providerRequestId,
-    model: extracted.model || model,
+    add(chunk) {
+      const record = coerceObjectRecord(chunk);
+      if (!record) {
+        return;
+      }
+      providerRequestId = cleanString(recordField(record, 'responseId', 'response_id', 'id', 'name')) || providerRequestId;
+      model = cleanString(recordField(record, 'modelVersion', 'model_version', 'model')) || model;
+      if (nestedRecord(record, 'usageMetadata', 'usage_metadata')) {
+        lastWithUsage = record;
+      }
+    },
+    result() {
+      if (!lastWithUsage) {
+        return { provider: 'gemini', providerRequestId, model };
+      }
+      const extracted = extractGeminiUsage(lastWithUsage);
+      return {
+        ...extracted,
+        providerRequestId: extracted.providerRequestId || providerRequestId,
+        model: extracted.model || model,
+      };
+    },
+  };
+}
+
+export function extractGeminiStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+  return foldStreamUsage(createGeminiStreamUsageAccumulator, chunks);
+}
+
+export function createVertexStreamUsageAccumulator(): LLMStreamUsageAccumulator {
+  const gemini = createGeminiStreamUsageAccumulator();
+  return {
+    add: gemini.add,
+    result: () => ({ ...gemini.result(), provider: 'vertex_ai' }),
   };
 }
 
 export function extractVertexStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
-  return {
-    ...extractGeminiStreamUsage(chunks),
-    provider: 'vertex_ai',
-  };
+  return foldStreamUsage(createVertexStreamUsageAccumulator, chunks);
 }
 
 export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
@@ -2897,7 +2958,7 @@ export function extractBedrockUsage(response: unknown): Partial<LLMUsageEvent> {
  * token increments, unlike Gemini/Vertex streams where usage is cumulative in
  * the final metadata chunk.
  */
-export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+export function createBedrockStreamUsageAccumulator(): LLMStreamUsageAccumulator {
   let providerRequestId: string | undefined;
   let model: string | undefined;
   let inputTokens: number | undefined;
@@ -2910,50 +2971,58 @@ export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUs
   const extraUsageUnits: Record<string, number> = {};
   const lastExtraUsageUnits: Record<string, number> = {};
   let sawUsage = false;
-  for (const chunk of chunks) {
-    const record = coerceObjectRecord(chunk);
-    if (!record) {
-      continue;
-    }
-    providerRequestId = cleanString(recordField(record, 'requestId', 'request_id')) || providerRequestId;
-    model = cleanString(recordField(record, 'modelId', 'model_id', 'model')) || model;
-    const usage = nestedRecord(record, 'usage');
-    if (!usage) {
-      continue;
-    }
-    const input = cleanNumber(recordField(usage, 'inputTokens', 'input_tokens'));
-    const output = cleanNumber(recordField(usage, 'outputTokens', 'output_tokens'));
-    const total = cleanNumber(recordField(usage, 'totalTokens', 'total_tokens'));
-    const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
-    const completionDetails = recordField(usage, 'completionTokensDetails', 'completion_tokens_details', 'outputTokensDetails', 'output_tokens_details');
-    const chunkExtraUsageUnits = extractRuntimeExtraUsageUnits(
-      usage,
-      promptDetails,
-      completionDetails,
-    ) || {};
-    ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(inputTokens, lastInputTokens, input));
-    ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(outputTokens, lastOutputTokens, output));
-    ({ total: cachedInputTokens, lastSeen: lastCachedInputTokens } = accumulateStreamingCounter(
-      cachedInputTokens,
-      lastCachedInputTokens,
-      cleanNumber(recordField(usage, 'cacheReadInputTokens', 'cache_read_input_tokens')),
-    ));
-    if (input !== undefined || output !== undefined || Object.keys(chunkExtraUsageUnits).length > 0) {
-      sawUsage = true;
-    }
-    accumulateStreamingUsageMap(extraUsageUnits, lastExtraUsageUnits, chunkExtraUsageUnits);
-    totalTokens = total ?? totalTokens;
-  }
   return {
-    provider: 'bedrock',
-    providerRequestId,
-    model,
-    inputTokens: sawUsage ? withCacheReads(inputTokens, cachedInputTokens) : undefined,
-    outputTokens: sawUsage ? outputTokens : undefined,
-    totalTokens: totalTokens ?? (sawUsage ? (withCacheReads(inputTokens, cachedInputTokens) || 0) + (outputTokens || 0) : undefined),
-    ...(sawUsage && cachedInputTokens !== undefined ? { cachedInputTokens, cacheHit: cachedInputTokens > 0 || undefined } : {}),
-    extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
+    add(chunk) {
+      const record = coerceObjectRecord(chunk);
+      if (!record) {
+        return;
+      }
+      providerRequestId = cleanString(recordField(record, 'requestId', 'request_id')) || providerRequestId;
+      model = cleanString(recordField(record, 'modelId', 'model_id', 'model')) || model;
+      const usage = nestedRecord(record, 'usage');
+      if (!usage) {
+        return;
+      }
+      const input = cleanNumber(recordField(usage, 'inputTokens', 'input_tokens'));
+      const output = cleanNumber(recordField(usage, 'outputTokens', 'output_tokens'));
+      const total = cleanNumber(recordField(usage, 'totalTokens', 'total_tokens'));
+      const promptDetails = recordField(usage, 'promptTokensDetails', 'prompt_tokens_details', 'inputTokensDetails', 'input_tokens_details');
+      const completionDetails = recordField(usage, 'completionTokensDetails', 'completion_tokens_details', 'outputTokensDetails', 'output_tokens_details');
+      const chunkExtraUsageUnits = extractRuntimeExtraUsageUnits(
+        usage,
+        promptDetails,
+        completionDetails,
+      ) || {};
+      ({ total: inputTokens, lastSeen: lastInputTokens } = accumulateStreamingCounter(inputTokens, lastInputTokens, input));
+      ({ total: outputTokens, lastSeen: lastOutputTokens } = accumulateStreamingCounter(outputTokens, lastOutputTokens, output));
+      ({ total: cachedInputTokens, lastSeen: lastCachedInputTokens } = accumulateStreamingCounter(
+        cachedInputTokens,
+        lastCachedInputTokens,
+        cleanNumber(recordField(usage, 'cacheReadInputTokens', 'cache_read_input_tokens')),
+      ));
+      if (input !== undefined || output !== undefined || Object.keys(chunkExtraUsageUnits).length > 0) {
+        sawUsage = true;
+      }
+      accumulateStreamingUsageMap(extraUsageUnits, lastExtraUsageUnits, chunkExtraUsageUnits);
+      totalTokens = total ?? totalTokens;
+    },
+    result() {
+      return {
+        provider: 'bedrock',
+        providerRequestId,
+        model,
+        inputTokens: sawUsage ? withCacheReads(inputTokens, cachedInputTokens) : undefined,
+        outputTokens: sawUsage ? outputTokens : undefined,
+        totalTokens: totalTokens ?? (sawUsage ? (withCacheReads(inputTokens, cachedInputTokens) || 0) + (outputTokens || 0) : undefined),
+        ...(sawUsage && cachedInputTokens !== undefined ? { cachedInputTokens, cacheHit: cachedInputTokens > 0 || undefined } : {}),
+        extraUsageUnits: Object.keys(extraUsageUnits).length ? extraUsageUnits : undefined,
+      };
+    },
   };
+}
+
+export function extractBedrockStreamUsage(chunks: Array<unknown>): Partial<LLMUsageEvent> {
+  return foldStreamUsage(createBedrockStreamUsageAccumulator, chunks);
 }
 
 export const PROVIDER_USAGE_EXTRACTORS: ReadonlyArray<Readonly<ProviderUsageExtractorDescriptor>> = Object.freeze([
@@ -2962,39 +3031,42 @@ export const PROVIDER_USAGE_EXTRACTORS: ReadonlyArray<Readonly<ProviderUsageExtr
     aliases: Object.freeze(['openai']),
     responseExtractor: extractOpenAIUsage,
     streamExtractor: extractOpenAIStreamUsage,
+    streamUsageAccumulator: createOpenAIStreamUsageAccumulator,
   }),
   Object.freeze({
     provider: 'azure',
     aliases: Object.freeze(['azure']),
     responseExtractor: extractAzureUsage,
-    streamExtractor: (chunks: unknown[]) => ({
-      ...extractOpenAIStreamUsage(chunks),
-      provider: 'azure',
-    }),
+    streamExtractor: (chunks: unknown[]) => foldStreamUsage(createAzureStreamUsageAccumulator, chunks),
+    streamUsageAccumulator: createAzureStreamUsageAccumulator,
   }),
   Object.freeze({
     provider: 'anthropic',
     aliases: Object.freeze(['anthropic']),
     responseExtractor: extractAnthropicUsage,
     streamExtractor: extractAnthropicStreamUsage,
+    streamUsageAccumulator: createAnthropicStreamUsageAccumulator,
   }),
   Object.freeze({
     provider: 'gemini',
     aliases: Object.freeze(['gemini']),
     responseExtractor: extractGeminiUsage,
     streamExtractor: extractGeminiStreamUsage,
+    streamUsageAccumulator: createGeminiStreamUsageAccumulator,
   }),
   Object.freeze({
     provider: 'vertex_ai',
     aliases: Object.freeze(['vertex_ai', 'vertex-ai', 'vertex']),
     responseExtractor: extractVertexUsage,
     streamExtractor: extractVertexStreamUsage,
+    streamUsageAccumulator: createVertexStreamUsageAccumulator,
   }),
   Object.freeze({
     provider: 'bedrock',
     aliases: Object.freeze(['bedrock']),
     responseExtractor: extractBedrockUsage,
     streamExtractor: extractBedrockStreamUsage,
+    streamUsageAccumulator: createBedrockStreamUsageAccumulator,
   }),
 ]);
 
@@ -3023,6 +3095,10 @@ export function getProviderStreamUsageExtractor(provider?: string): LLMUsageExtr
   return findProviderUsageExtractor(provider)?.streamExtractor;
 }
 
+export function getProviderStreamUsageAccumulator(provider?: string): (() => LLMStreamUsageAccumulator) | undefined {
+  return findProviderUsageExtractor(provider)?.streamUsageAccumulator;
+}
+
 export function listSupportedProviders(): ProviderSupportMatrixEntry[] {
   return PROVIDER_SUPPORT_MATRIX.map((descriptor) => ({
     provider: descriptor.provider,
@@ -3045,14 +3121,10 @@ function selectOpenAICompatibleResponseExtractor(provider?: string): (response: 
     : extractOpenAIUsage;
 }
 
-function selectOpenAICompatibleStreamExtractor(provider?: string): (chunks: Array<Record<string, unknown>>) => Partial<LLMUsageEvent> {
-  if (normalizeOpenAICompatibleProvider(provider) === 'azure') {
-    return (chunks) => ({
-      ...extractOpenAIStreamUsage(chunks),
-      provider: 'azure',
-    });
-  }
-  return extractOpenAIStreamUsage;
+function selectOpenAICompatibleStreamAccumulator(provider?: string): () => LLMStreamUsageAccumulator {
+  return normalizeOpenAICompatibleProvider(provider) === 'azure'
+    ? createAzureStreamUsageAccumulator
+    : createOpenAIStreamUsageAccumulator;
 }
 
 function isPromiseLike<T>(value: unknown): value is PromiseLike<T> {
@@ -3410,21 +3482,20 @@ export async function instrumentOpenAICompatibleResponse<TResponse extends Recor
 export async function* instrumentOpenAICompatibleStream<TChunk extends Record<string, unknown>>(
   client: LLMObservabilityClient,
   stream: AsyncIterable<TChunk> | Iterable<TChunk> | Promise<AsyncIterable<TChunk> | Iterable<TChunk>>,
-  options: OpenAICompatibleStreamInstrumentationOptions = {},
+  options: OpenAICompatibleInstrumentationOptions = {},
 ): AsyncGenerator<TChunk, void, unknown> {
   const provider = normalizeOpenAICompatibleProvider(options.provider);
   for await (const chunk of client.observeStream({
     provider,
     model: options.model || 'unknown',
     call: () => stream,
-    extractUsage: selectOpenAICompatibleStreamExtractor(provider),
+    usageAccumulator: selectOpenAICompatibleStreamAccumulator(provider),
     attribution: options.attribution,
     agent: options.agent,
     metadata: options.metadata,
     requestId: options.requestId,
     traceId: options.traceId,
     fireAndForget: options.fireAndForget,
-    maxBufferedChunks: options.maxBufferedChunks,
   })) {
     yield chunk;
   }

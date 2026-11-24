@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Breaking: stream helpers (`observeStream`, `observeStreamCall`, `createObservedStream`, `bindObservedStream`, stream bindings of `wrapObservedService`) take `usageAccumulator` instead of `extractUsage`, and `maxBufferedChunks` and `OpenAICompatibleStreamInstrumentationOptions` are removed. Stream usage is now folded chunk by chunk, so streams longer than 256 chunks keep the usage, id, and model of their first chunks (Anthropic input and cache tokens).
+- Added `createOpenAIStreamUsageAccumulator`, `createAnthropicStreamUsageAccumulator`, `createGeminiStreamUsageAccumulator`, `createVertexStreamUsageAccumulator`, `createBedrockStreamUsageAccumulator`, and `getProviderStreamUsageAccumulator`.
+- A usage accumulator error is reported through `onError` and no longer interrupts the stream.
+
 ## 0.5.0
 
 - Added Anthropic advisor usage, per advisor model, as `advisorUsage`.

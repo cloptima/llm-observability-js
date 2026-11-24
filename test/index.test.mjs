@@ -32,7 +32,9 @@ const {
   createMappedUsageExtractor,
   createObservedCall,
   createObservedStream,
+  createAnthropicStreamUsageAccumulator,
   createInstrumentedFetch,
+  createOpenAIStreamUsageAccumulator,
   disabledClient,
   DisabledCloptimaLLMObservability,
   extractAnthropicStreamUsage,
@@ -49,6 +51,7 @@ const {
   instrumentOpenAICompatibleStream,
   extractOpenAIUsage,
   extractOpenAIStreamUsage,
+  getProviderStreamUsageAccumulator,
   getProviderStreamUsageExtractor,
   getProviderUsageExtractor,
   listSupportedProviders,
@@ -1248,7 +1251,7 @@ test('createObservedCall and createObservedStream reduce wrapper boilerplate and
   const observeStream = createObservedStream(client, {
     provider: 'anthropic',
     model: 'claude-3-5-sonnet',
-    extractUsage: extractAnthropicStreamUsage,
+    usageAccumulator: createAnthropicStreamUsageAccumulator,
     metadata: { channel: 'stream' },
     fireAndForget: false,
   });
@@ -1326,7 +1329,7 @@ test('bindObservedCall and bindObservedStream wrap existing service methods with
     {
       provider: 'anthropic',
       model: 'claude-3-5-sonnet',
-      extractUsage: extractAnthropicStreamUsage,
+      usageAccumulator: createAnthropicStreamUsageAccumulator,
       metadata: { service: 'provider-service-stream' },
       fireAndForget: false,
     },
@@ -1404,7 +1407,7 @@ test('wrapObservedService wraps multiple existing service methods together', asy
       options: {
         provider: 'anthropic',
         model: 'claude-3-5-sonnet',
-        extractUsage: extractAnthropicStreamUsage,
+        usageAccumulator: createAnthropicStreamUsageAccumulator,
         fireAndForget: false,
       },
       resolveOverrides: (_text, requestId) => ({ requestId }),
@@ -1884,7 +1887,7 @@ test('observeStream yields chunks and records final stream usage', async () => {
     model: 'gpt-4o-mini',
     fireAndForget: false,
     call: stream,
-    extractUsage: extractOpenAIStreamUsage,
+    usageAccumulator: createOpenAIStreamUsageAccumulator,
   })) {
     emitted.push(chunk);
   }
@@ -2106,53 +2109,6 @@ test('instrumentOpenAICompatibleResponse reports a provider the caller names unc
     assert.ok(body, legacyProvider);
     assert.equal(body.provider, legacyProvider, legacyProvider);
   }
-});
-
-test('observeStream defaults to fire-and-forget recording and bounds extractor chunks', async () => {
-  let body;
-  const observedChunkLengths = [];
-  const client = new CloptimaLLMObservability({
-    apiBaseUrl: TEST_API_BASE_URL,
-    apiKey: 'pat-test',
-    defaultAttribution: {
-      appId: 'agent-api',
-      environment: 'dev',
-    },
-    fetchImpl: async (_input, init) => {
-      body = JSON.parse(String(init?.body));
-      return new Response('{}', { status: 202 });
-    },
-  });
-
-  function* stream() {
-    yield { id: 'stream-cap-1', model: 'gpt-4o-mini' };
-    yield { id: 'stream-cap-2', model: 'gpt-4o-mini' };
-    yield {
-      id: 'stream-cap-3',
-      model: 'gpt-4o-mini',
-      usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
-    };
-  }
-
-  const emitted = [];
-  for await (const chunk of client.observeStream({
-    provider: 'openai',
-    model: 'gpt-4o-mini',
-    call: stream,
-    maxBufferedChunks: 2,
-    extractUsage: (chunks) => {
-      observedChunkLengths.push(chunks.length);
-      return extractOpenAIStreamUsage(chunks);
-    },
-  })) {
-    emitted.push(chunk);
-  }
-  assert.equal(await client.flush(2000), true);
-
-  assert.equal(emitted.length, 3);
-  assert.deepEqual(observedChunkLengths, [2]);
-  assert.equal(body?.provider_request_id, 'stream-cap-3');
-  assert.equal(body?.input_tokens, 1);
 });
 
 test('observeStream records partial telemetry when stream fails after chunks', async () => {
@@ -2713,5 +2669,223 @@ test('provider usage fixture replay covers supported SDK extractors', () => {
       camelExpected(fixture.expected),
       fixture.name,
     );
+  }
+});
+
+test('stream fixture replay folds every chunk through one observed stream binding per provider', async () => {
+  const bodies = [];
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: { appId: 'agent-api', environment: 'dev' },
+    fetchImpl: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response('{}', { status: 202 });
+    },
+  });
+  const streamFixtures = providerUsageReplayFixtures.filter((fixture) => fixture.kind === 'stream');
+  // A stream longer than the old 256-chunk buffer must keep its first chunk's usage.
+  assert.ok(streamFixtures.some((fixture) => fixture.payload.length > 256));
+  const bindings = new Map();
+  for (const fixture of streamFixtures) {
+    if (!bindings.has(fixture.provider)) {
+      bindings.set(fixture.provider, createObservedStream(client, {
+        provider: fixture.provider,
+        model: 'fixture-model',
+        usageAccumulator: getProviderStreamUsageAccumulator(fixture.provider),
+        fireAndForget: false,
+      }));
+    }
+    const emitted = [];
+    for await (const chunk of bindings.get(fixture.provider)(function* () { yield* fixture.payload; })) {
+      emitted.push(chunk);
+    }
+    assert.equal(emitted.length, fixture.payload.length, fixture.name);
+    const body = bodies.at(-1);
+    for (const [key, value] of Object.entries(fixture.expected)) {
+      assert.deepEqual(body[key], value, `${fixture.name}: ${key}`);
+    }
+  }
+  assert.equal(bodies.length, streamFixtures.length);
+});
+
+test('observeStream delivers every chunk and reports the error when the usage accumulator throws', async () => {
+  const errors = [];
+  let body;
+  const client = new CloptimaLLMObservability({
+    apiBaseUrl: TEST_API_BASE_URL,
+    apiKey: 'pat-test',
+    defaultAttribution: { appId: 'agent-api', environment: 'dev' },
+    onError: (error) => errors.push(error),
+    fetchImpl: async (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return new Response('{}', { status: 202 });
+    },
+  });
+  let adds = 0;
+  const emitted = [];
+  for await (const chunk of client.observeStream({
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    fireAndForget: false,
+    call: () => [
+      { id: 'chunk-1', usage: { prompt_tokens: 9 } },
+      { id: 'chunk-2' },
+      { id: 'chunk-3', usage: { prompt_tokens: 9 } },
+    ],
+    usageAccumulator: () => ({
+      add() {
+        adds += 1;
+        if (adds === 2) throw new Error('accumulator broke');
+      },
+      result: () => ({ inputTokens: 9 }),
+    }),
+  })) {
+    emitted.push(chunk.id);
+  }
+
+  assert.deepEqual(emitted, ['chunk-1', 'chunk-2', 'chunk-3']);
+  assert.equal(adds, 2);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /accumulator broke/);
+  assert.equal(body?.status, 'succeeded');
+  assert.equal(body?.input_tokens, undefined);
+});
+
+test('observeStream records the event without usage when the accumulator factory, add, or result fails', async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const failures = {
+      factory: [() => {
+        throw new Error('factory broke');
+      }, /^factory broke$/],
+      'async factory': [async () => {
+        throw new Error('async factory broke');
+      }, /factory must be synchronous/],
+      result: [() => ({
+        add() {},
+        result() {
+          throw new Error('result broke');
+        },
+      }), /^result broke$/],
+      'async result': [() => ({
+        add() {},
+        result: async () => {
+          throw new Error('async result broke');
+        },
+      }), /^usage accumulator result\(\) must be synchronous$/],
+      'resolving async add': [() => {
+        let inputTokens = 0;
+        return {
+          add: async () => {
+            await Promise.resolve();
+            inputTokens += 9;
+          },
+          result: () => ({ inputTokens }),
+        };
+      }, /^usage accumulator add\(\) must be synchronous$/],
+      'resolving async result': [() => ({
+        add() {},
+        result: async () => ({ inputTokens: 9 }),
+      }), /^usage accumulator result\(\) must be synchronous$/],
+    };
+    for (const [name, [usageAccumulator, expectedError]] of Object.entries(failures)) {
+      const errors = [];
+      let body;
+      const client = new CloptimaLLMObservability({
+        apiBaseUrl: TEST_API_BASE_URL,
+        apiKey: 'pat-test',
+        defaultAttribution: { appId: 'agent-api', environment: 'dev' },
+        onError: (error) => errors.push(error),
+        fetchImpl: async (_input, init) => {
+          body = JSON.parse(String(init?.body));
+          return new Response('{}', { status: 202 });
+        },
+      });
+      const emitted = [];
+      for await (const chunk of client.observeStream({
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        fireAndForget: false,
+        call: () => ['chunk-1', 'chunk-2'],
+        usageAccumulator,
+      })) {
+        emitted.push(chunk);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(emitted, ['chunk-1', 'chunk-2'], name);
+      assert.equal(errors.length, 1, name);
+      assert.match(errors[0].message, expectedError, name);
+      assert.equal(body?.status, 'succeeded', name);
+      assert.equal(body?.input_tokens, undefined, name);
+    }
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('observeStream keeps delivering chunks when onError throws or an async accumulator rejects', async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const throwingHookClient = new CloptimaLLMObservability({
+      apiBaseUrl: TEST_API_BASE_URL,
+      apiKey: 'pat-test',
+      defaultAttribution: { appId: 'agent-api', environment: 'dev' },
+      onError: () => {
+        throw new Error('hook broke');
+      },
+      fetchImpl: async () => new Response('{}', { status: 202 }),
+    });
+    const emitted = [];
+    for await (const chunk of throwingHookClient.observeStream({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      fireAndForget: false,
+      call: () => ['chunk-1', 'chunk-2', 'chunk-3'],
+      usageAccumulator: () => ({
+        add() {
+          throw new Error('accumulator broke');
+        },
+        result: () => ({}),
+      }),
+    })) {
+      emitted.push(chunk);
+    }
+    assert.deepEqual(emitted, ['chunk-1', 'chunk-2', 'chunk-3']);
+
+    const errors = [];
+    const asyncClient = new CloptimaLLMObservability({
+      apiBaseUrl: TEST_API_BASE_URL,
+      apiKey: 'pat-test',
+      defaultAttribution: { appId: 'agent-api', environment: 'dev' },
+      onError: (error) => errors.push(error),
+      fetchImpl: async () => new Response('{}', { status: 202 }),
+    });
+    const asyncEmitted = [];
+    for await (const chunk of asyncClient.observeStream({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      fireAndForget: false,
+      call: () => ['chunk-1', 'chunk-2'],
+      usageAccumulator: () => ({
+        add: async () => {
+          throw new Error('async accumulator broke');
+        },
+        result: () => ({}),
+      }),
+    })) {
+      asyncEmitted.push(chunk);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(asyncEmitted, ['chunk-1', 'chunk-2']);
+    assert.deepEqual(errors.map((error) => error.message), ['usage accumulator add() must be synchronous']);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
   }
 });
